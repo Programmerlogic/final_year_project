@@ -272,6 +272,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional SUMO tripinfo XML output path (--tripinfo-output).",
     )
     parser.add_argument(
+        "--tripinfo-write-unfinished",
+        action="store_true",
+        help="Include vehicles that have not arrived by simulation end in tripinfo output.",
+    )
+    parser.add_argument(
         "--kpi-output-dir",
         default=None,
         help=(
@@ -517,7 +522,15 @@ def _apply_emergency_priority_policy(
     }
 
 
-def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_response: dict) -> dict[str, Any]:
+def _apply_server_reroute_policy(
+    traci_module,
+    vehicle_ids: list[str],
+    route_response: dict,
+    *,
+    sim_time: float | None = None,
+    reroute_cooldown_until: dict[str, float] | None = None,
+    reroute_cooldown_seconds: float = 25.0,
+) -> dict[str, Any]:
     """Apply live rerouting decisions from server policy fields.
 
     This is the runtime bridge that turns cloud policy output into TraCI route updates.
@@ -545,6 +558,14 @@ def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_res
     except Exception:
         min_confidence = 0.5
 
+    if not emergency_active:
+        try:
+            conf_floor = float(os.getenv("HYBRID_REROUTE_MIN_CONF_FLOOR", "0.58"))
+        except Exception:
+            conf_floor = 0.58
+        conf_floor = max(0.0, min(1.0, conf_floor))
+        min_confidence = max(min_confidence, conf_floor)
+
     if confidence < min_confidence and not emergency_active:
         return {"count": 0, "vehicle_ids": []}
 
@@ -556,6 +577,13 @@ def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_res
     except Exception:
         reroute_fraction = 0.0
     reroute_fraction = max(0.0, min(1.0, reroute_fraction))
+    if not emergency_active:
+        try:
+            fraction_cap = float(os.getenv("HYBRID_REROUTE_FRACTION_CAP", "0.12"))
+        except Exception:
+            fraction_cap = 0.12
+        fraction_cap = max(0.0, min(1.0, fraction_cap))
+        reroute_fraction = min(reroute_fraction, fraction_cap)
 
     reroute_mode = str(rec.get("reroute_mode", "travel_time"))
     fallback_algorithm = str(rec.get("fallback_algorithm", "")).lower()
@@ -589,7 +617,11 @@ def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_res
     else:
         if reroute_fraction <= 0.0:
             return {"count": 0, "vehicle_ids": []}
-        target_count = max(1, int(len(vehicle_ids) * reroute_fraction))
+        # Keep fraction semantics literal; avoid forced reroutes when the
+        # requested fraction rounds down to zero.
+        target_count = int(len(vehicle_ids) * reroute_fraction)
+        if target_count <= 0:
+            return {"count": 0, "vehicle_ids": []}
         if planned_reroutes:
             planned_reroutes = planned_reroutes[:target_count]
         else:
@@ -598,6 +630,13 @@ def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_res
     applied = 0
     rerouted_ids: list[str] = []
     for vid, mode in planned_reroutes:
+        if (
+            reroute_cooldown_until is not None
+            and sim_time is not None
+            and float(reroute_cooldown_until.get(vid, -1.0)) > sim_time
+        ):
+            continue
+
         if not _is_reroute_safe_now(traci_module, vid):
             continue
 
@@ -611,11 +650,15 @@ def _apply_server_reroute_policy(traci_module, vehicle_ids: list[str], route_res
                 traci_module.vehicle.rerouteTraveltime(vid)
             applied += 1
             rerouted_ids.append(vid)
+            if reroute_cooldown_until is not None and sim_time is not None:
+                reroute_cooldown_until[vid] = sim_time + max(1.0, reroute_cooldown_seconds)
         except Exception:
             if fallback_algorithm == "dijkstra":
                 if _reroute_with_dijkstra_fallback(traci_module, vid):
                     applied += 1
                     rerouted_ids.append(vid)
+                    if reroute_cooldown_until is not None and sim_time is not None:
+                        reroute_cooldown_until[vid] = sim_time + max(1.0, reroute_cooldown_seconds)
             continue
 
     return {"count": applied, "vehicle_ids": rerouted_ids}
@@ -1842,6 +1885,7 @@ def main() -> None:
         statistics_output_path=statistics_output_path,
         summary_output_path=summary_output_path,
         tripinfo_output_path=tripinfo_output_path,
+        tripinfo_write_unfinished=bool(args.tripinfo_write_unfinished),
     )
     max_steps = args.max_steps if args.max_steps is not None else config.default_max_steps
 
@@ -1954,8 +1998,14 @@ def main() -> None:
 
     try:
         last_hybrid_push_sim_time = -1e9
+        try:
+            reroute_cooldown_seconds = float(os.getenv("HYBRID_REROUTE_COOLDOWN_SECONDS", "20.0"))
+        except Exception:
+            reroute_cooldown_seconds = 20.0
+        reroute_cooldown_seconds = max(1.0, reroute_cooldown_seconds)
         held_until: dict[str, float] = {}
         reroute_highlight_until: dict[str, float] = {}
+        reroute_cooldown_until: dict[str, float] = {}
         enable_vehicle_markers = args.controlled_count > 0 or args.emergency_count > 0
         rsu_graph_registered: list[bool] = [False]  # mutable flag for closure
 
@@ -1997,6 +2047,9 @@ def main() -> None:
                 active_vehicle_ids=active_vehicle_ids,
                 reroute_highlight_until=reroute_highlight_until,
             )
+            for vid, until in list(reroute_cooldown_until.items()):
+                if vid not in active_vehicle_ids or sim_time >= until:
+                    reroute_cooldown_until.pop(vid, None)
             if step_idx % 50 == 0 and reroute_marker_count > 0:
                 print(f"[SUMO][MARKERS] reroute_highlights={reroute_marker_count}")
 
@@ -2096,7 +2149,7 @@ def main() -> None:
                 "timestamp": sim_time,
                 "vehicle_count": len(local_vehicles),
                 "avg_speed_mps": avg_speed_mps,
-                "vehicle_ids": vehicle_ids,          # full list for directive scope
+                "vehicle_ids": local_vehicles,
                 "emergency_vehicle_ids": emergency_vehicle_ids,
                 "features": {
                     "scenario": config.scenario,
@@ -2111,7 +2164,14 @@ def main() -> None:
             route_url = args.server_url.rstrip("/") + "/route"
             route_response = _post_json(route_url, uplink_payload, timeout_seconds=max(0.1, args.route_timeout_seconds))
             if route_response is not None:
-                reroute_result = _apply_server_reroute_policy(traci_module, vehicle_ids, route_response)
+                reroute_result = _apply_server_reroute_policy(
+                    traci_module,
+                    local_vehicles,
+                    route_response,
+                    sim_time=sim_time,
+                    reroute_cooldown_until=reroute_cooldown_until,
+                    reroute_cooldown_seconds=reroute_cooldown_seconds,
+                )
                 reroutes_applied = int(reroute_result.get("count", 0))
                 if args.reroute_highlight_seconds > 0:
                     hold_until = sim_time + max(0.1, args.reroute_highlight_seconds)
@@ -2154,9 +2214,10 @@ def main() -> None:
         if rl_signal_controller is not None:
             rl_summary = rl_signal_controller.summary()
             print(
-                "[SUMO][RL] summary: junctions={j} steps={s}".format(
+                "[SUMO][RL] summary: junctions={j} steps={s} signal_switches={sw}".format(
                     j=rl_summary.get("junctions_controlled", 0),
                     s=rl_summary.get("total_steps", 0),
+                    sw=rl_summary.get("signal_switches", 0),
                 )
             )
     finally:

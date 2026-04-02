@@ -268,9 +268,12 @@ class TrafficSignalEnv:
     def compute_reward(self) -> float:
         """Compute per-step reward from TraCI state."""
         total_halting = 0.0
+        total_waiting = 0.0
         try:
             for lane in self._incoming_lanes:
                 total_halting += float(self._traci.lane.getLastStepHaltingNumber(lane))
+                if self._cfg.reward_waiting_time_weight > 0:
+                    total_waiting += float(self._traci.lane.getWaitingTime(lane))
         except Exception:
             pass
 
@@ -292,8 +295,16 @@ class TrafficSignalEnv:
 
         throughput_bonus = (throughput / 10.0) * self._cfg.reward_throughput_weight
 
+        # Waiting-time penalty is normalized per lane and clipped for stability.
+        waiting_penalty = 0.0
+        if self._cfg.reward_waiting_time_weight > 0:
+            lane_count = max(1.0, float(len(self._incoming_lanes)))
+            mean_waiting_s = total_waiting / lane_count
+            waiting_norm = min(1.0, max(0.0, mean_waiting_s / 60.0))
+            waiting_penalty = -waiting_norm * self._cfg.reward_waiting_time_weight
+
         self._prev_halting = total_halting
-        return halt_penalty + throughput_bonus
+        return halt_penalty + throughput_bonus + waiting_penalty
 
     # ── Action application ────────────────────────────────────────────────
 
@@ -567,4 +578,6 @@ class MultiJunctionEnv:
         return {tid: self._envs[tid].compute_reward() for tid in self.tls_ids}
 
     def reset_all(self, sim_time: float = 0.0) -> dict[str, np.ndarray]:
-        return {tid: self._envs[tid].reset(sim_time) for tid in self.tls_ids}
+        for tid in self.tls_ids:
+            self._envs[tid].reset(sim_time)
+        return self.observe_all(sim_time)

@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from controllers.rl.dqn_agent import DQNAgent
+from controllers.rl.improved_dqn_agent import ImprovedDQNAgent
 from controllers.rl.baselines import SimpleActuatedPolicy
 from controllers.rl.safety_guardrails import GuardrailConfig, TLSSafetyGuardrail
 from controllers.rl.traffic_signal_env import (
@@ -36,6 +37,9 @@ from controllers.rl.traffic_signal_env import (
     MultiJunctionEnv,
     TrafficSignalEnv,
 )
+
+
+RLPolicy = DQNAgent | ImprovedDQNAgent | SimpleActuatedPolicy
 
 
 class RLSignalController:
@@ -71,10 +75,33 @@ class RLSignalController:
         self._neighbour_k = neighbour_k
 
         self._env: MultiJunctionEnv | None = None
-        self._agents: dict[str, DQNAgent | SimpleActuatedPolicy] = {}
+        self._agents: dict[str, RLPolicy] = {}
         self._initialized = False
         self._step_count = 0
+        self._total_switches = 0
         self._cumulative_reward: dict[str, float] = {}
+
+    def _load_saved_agent(self) -> DQNAgent | ImprovedDQNAgent:
+        if self._model_dir is None:
+            raise FileNotFoundError("model_dir is not configured")
+
+        run_dir = self._model_dir / "latest"
+        meta_path = run_dir / "meta.json"
+        agent_version = ""
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                agent_version = str(meta.get("agent_version", "")).lower()
+            except Exception:
+                agent_version = ""
+
+        if agent_version.startswith("improved_dqn"):
+            return ImprovedDQNAgent.load(self._model_dir, run_id="latest")
+
+        try:
+            return DQNAgent.load(self._model_dir, run_id="latest")
+        except Exception:
+            return ImprovedDQNAgent.load(self._model_dir, run_id="latest")
 
     # ── Lazy initialisation ───────────────────────────────────────────────
 
@@ -105,21 +132,23 @@ class RLSignalController:
         self._env.reset_all(sim_time)
 
         # Load agents
-        use_dqn = self._model_dir is not None and (self._model_dir / "latest" / "weights.npz").exists()
+        use_saved_model = self._model_dir is not None and (self._model_dir / "latest" / "weights.npz").exists()
+        loaded_agent_name = "SimpleActuated"
 
         for tid in tls_ids:
-            if use_dqn:
+            if use_saved_model:
                 try:
-                    agent = DQNAgent.load(self._model_dir, run_id="latest")
+                    agent = self._load_saved_agent()
                     agent.epsilon = 0.0  # pure greedy in inference
                     self._agents[tid] = agent
+                    loaded_agent_name = type(agent).__name__
                 except Exception as exc:
-                    print(f"[RL] Failed to load DQN for {tid}: {exc} — using SimpleActuated fallback")
+                    print(f"[RL] Failed to load RL weights for {tid}: {exc} — using SimpleActuated fallback")
                     self._agents[tid] = SimpleActuatedPolicy()
             else:
                 self._agents[tid] = SimpleActuatedPolicy()
 
-        policy_name = "DQN" if use_dqn else "SimpleActuated(fallback)"
+        policy_name = loaded_agent_name if use_saved_model else "SimpleActuated(fallback)"
         print(f"[RL] Policy: {policy_name}")
         self._cumulative_reward = {tid: 0.0 for tid in tls_ids}
         self._initialized = True
@@ -147,7 +176,7 @@ class RLSignalController:
             agent = self._agents.get(tid)
             if agent is None:
                 actions[tid] = 0
-            elif isinstance(agent, DQNAgent):
+            elif isinstance(agent, (DQNAgent, ImprovedDQNAgent)):
                 obs = obs_map[tid]
                 # DQN was trained on OBS_DIM; MultiJunctionEnv adds 1 dim
                 if obs.shape[0] == OBS_DIM + 1:
@@ -166,6 +195,8 @@ class RLSignalController:
 
         info_map = self._env.apply_actions(actions, sim_time)
         rewards = self._env.compute_rewards()
+        step_switches = sum(1 for info in info_map.values() if info.get("switched"))
+        self._total_switches += step_switches
 
         for tid, r in rewards.items():
             self._cumulative_reward[tid] = self._cumulative_reward.get(tid, 0.0) + r
@@ -180,7 +211,7 @@ class RLSignalController:
             print(
                 f"[RL] step={self._step_count} junctions={len(tls_ids)} "
                 f"mean_halting_norm={total_halt/max(1,len(tls_ids)):.3f} "
-                f"switches={sum(1 for i in info_map.values() if i.get('switched'))}"
+                f"switches={step_switches}"
             )
 
         return {
@@ -227,6 +258,7 @@ class RLSignalController:
         return {
             "total_steps": self._step_count,
             "junctions_controlled": len(self._agents),
+            "signal_switches": int(self._total_switches),
             "cumulative_rewards": {
                 tid: round(r, 3) for tid, r in self._cumulative_reward.items()
             },

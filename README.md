@@ -1,5 +1,10 @@
 # Hybrid AI Traffic Management System (V2X)
 
+[![CI](https://github.com/Programmerlogic/final_year_project/actions/workflows/ci.yml/badge.svg)](https://github.com/Programmerlogic/final_year_project/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![SUMO](https://img.shields.io/badge/SUMO-1.18+-green.svg)](https://sumo.dlr.de/)
+
 A hybrid AI traffic management stack built on SUMO simulation that combines **congestion forecasting**, **uncertainty-aware routing**, and **adaptive signal control** for V2X (Vehicle-to-Everything) networks.
 
 ## Architecture
@@ -84,15 +89,57 @@ See `sumo/README.md` for full flag reference.
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1 | Data Pipeline (logging, labeling, splitting) | Complete |
-| 2 | Congestion Forecasting (LightGBM, 87.3% acc, 91.3% F1) | Complete |
-| 3 | Uncertainty-Aware Routing (risk score + confidence fallback) | Complete (true KPI regression gate pending) |
-| 4 | Adaptive Signal Control (RL/MARL) | In progress (P4.1/P4.4 PASS; P4.2/P4.3 pending training run) |
-| 5 | Hybrid Fusion Controller | Not started |
+| 1 | Data Pipeline (logging, labeling, splitting) | ✅ Complete |
+| 2 | Congestion Forecasting (LightGBM, 87.3% acc, 91.3% F1) | ✅ Complete |
+| 3 | Uncertainty-Aware Routing (risk score + confidence fallback) | ✅ Complete |
+| 4 | Adaptive Signal Control (RL/MARL) | ✅ Complete |
+| 5 | Hybrid Fusion Controller | 🔄 In Progress |
 
 ## Requirements
 
 - Python 3.10+
-- SUMO (with TraCI or libsumo)
+- SUMO 1.18+ (with TraCI or libsumo)
 - Dependencies: `pip install -r requirements.txt`
-- ML dependencies: scikit-learn, lightgbm (optional: xgboost, torch)
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/Programmerlogic/final_year_project.git
+cd final_year_project
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Verify SUMO installation
+sumo --version
+```
+
+## Documentation
+
+| Module | README |
+|--------|--------|
+| SUMO Simulation | [sumo/README.md](sumo/README.md) |
+| Forecasting Models | [models/forecast/README.md](models/forecast/README.md) |
+| Data Pipeline | [pipelines/processing/README.md](pipelines/processing/README.md) |
+| Controllers (RL/Fusion) | [controllers/README.md](controllers/README.md) |
+| Routing | [routing/README.md](routing/README.md) |
+| Evaluation | [evaluation/README.md](evaluation/README.md) |
+| Experiments | [experiments/README.md](experiments/README.md) |
+| Data | [data/README.md](data/README.md) |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and changes.

@@ -52,7 +52,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import numpy as np
 
@@ -73,6 +73,46 @@ from controllers.rl.traffic_signal_env import (
     TrafficSignalEnv,
     MultiJunctionEnv,
 )
+
+
+RLAgent = DQNAgent | ImprovedDQNAgent
+
+
+def _is_rl_agent(policy: Any) -> TypeGuard[RLAgent]:
+    return isinstance(policy, (DQNAgent, ImprovedDQNAgent))
+
+
+def _align_obs_dim(obs: np.ndarray, expected_dim: int) -> np.ndarray:
+    """Align observation dimensionality to the target agent input size."""
+    if obs.shape[0] == expected_dim:
+        return obs.astype(np.float32, copy=False)
+    if obs.shape[0] > expected_dim:
+        return obs[:expected_dim].astype(np.float32, copy=False)
+
+    pad = np.zeros(expected_dim - obs.shape[0], dtype=np.float32)
+    return np.concatenate([obs.astype(np.float32, copy=False), pad], dtype=np.float32)
+
+
+def _load_saved_rl_agent(model_dir: Path, run_id: str = "latest") -> RLAgent:
+    """Load the saved RL agent type from artifact metadata with safe fallback."""
+    run_dir = model_dir / run_id
+    meta_path = run_dir / "meta.json"
+
+    agent_version = ""
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            agent_version = str(meta.get("agent_version", "")).lower()
+        except Exception:
+            agent_version = ""
+
+    if agent_version.startswith("improved_dqn"):
+        return ImprovedDQNAgent.load(model_dir, run_id=run_id)
+
+    try:
+        return DQNAgent.load(model_dir, run_id=run_id)
+    except Exception:
+        return ImprovedDQNAgent.load(model_dir, run_id=run_id)
 
 
 # ── SUMO bootstrap ────────────────────────────────────────────────────────────
@@ -140,7 +180,7 @@ def _run_episode(
     max_steps: int,
     seed: int,
     *,
-    train_agent: DQNAgent | None = None,
+    train_agent: RLAgent | None = None,
     train_every: int = 4,
     env_cfg: EnvConfig | None = None,
 ) -> dict[str, Any]:
@@ -171,8 +211,9 @@ def _run_episode(
             sim_time = float(traci.simulation.getTime())
 
             # Select action
-            if isinstance(policy, DQNAgent):
-                action = policy.select_action(obs)
+            if _is_rl_agent(policy):
+                obs_input = _align_obs_dim(obs, int(policy.obs_dim))
+                action = policy.select_action(obs_input)
             elif isinstance(policy, (FixedTimePolicy, SimpleActuatedPolicy)):
                 action = policy.select_action(obs, tls_id, sim_time, n_phases=env.n_phases)
             else:
@@ -196,8 +237,10 @@ def _run_episode(
                 pass
 
             # Training (only when agent == policy)
-            if train_agent is not None and isinstance(policy, DQNAgent):
-                train_agent.store(obs, action, reward, next_obs, done)
+            if train_agent is not None and _is_rl_agent(policy):
+                train_obs = _align_obs_dim(obs, int(train_agent.obs_dim))
+                train_next_obs = _align_obs_dim(next_obs, int(train_agent.obs_dim))
+                train_agent.store(train_obs, action, reward, train_next_obs, done)
                 if step % train_every == 0:
                     loss = train_agent.train_step()
                     if loss is not None:
@@ -406,9 +449,9 @@ def _run_shared_multi_agent_train_episode(
 # ── Profile presets ───────────────────────────────────────────────────────────
 
 PROFILES = {
-    "smoke":  {"episodes": 5,   "steps_per_episode": 300},
-    "medium": {"episodes": 30,  "steps_per_episode": 1200},
-    "full":   {"episodes": 100, "steps_per_episode": 1800},
+    "smoke":  {"episodes": 12,  "steps_per_episode": 300},
+    "medium": {"episodes": 60,  "steps_per_episode": 1200},
+    "full":   {"episodes": 150, "steps_per_episode": 1800},
 }
 
 
@@ -432,6 +475,15 @@ def parse_args() -> argparse.Namespace:
                    help="Run one (or more) gradient updates every N simulation steps")
     p.add_argument("--train-updates-per-step", type=int, default=1,
                    help="How many gradient updates to run at each train step")
+    p.add_argument(
+        "--single-junction-finetune-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Optional post-training fine-tune episodes on the reference junction "
+            "(applies when --train-all-tls is enabled)."
+        ),
+    )
     p.add_argument("--eval-episodes", type=int, default=3,
                    help="Evaluation episodes per policy")
     p.add_argument("--seed", type=int, default=42, help="Base random seed")
@@ -453,6 +505,11 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum green time enforced by guardrail (seconds)")
     p.add_argument("--use-improved-dqn", action="store_true",
                    help="Use ImprovedDQNAgent with Double DQN and larger network")
+    p.add_argument(
+        "--force-basic-dqn",
+        action="store_true",
+        help="Disable automatic ImprovedDQN selection for all-TLS shared training.",
+    )
     p.add_argument("--tau", type=float, default=0.005,
                    help="Soft target update coefficient (for improved DQN)")
     p.add_argument("--grad-clip", type=float, default=10.0,
@@ -565,7 +622,8 @@ def _resolve_epsilon_decay(args: argparse.Namespace, training_mode: str) -> floa
     if args.epsilon_decay is not None:
         return float(args.epsilon_decay)
     if training_mode == "all_tls_shared":
-        return 0.9997
+        # Slower decay for long horizon/all-junction runs avoids premature policy collapse.
+        return 0.99995
     if args.profile == "full":
         return 0.9995
     if args.profile == "medium":
@@ -579,14 +637,38 @@ def _resolve_reward_weights(args: argparse.Namespace) -> tuple[float, float, flo
     if args.reward_throughput_weight is not None:
         throughput_w = float(args.reward_throughput_weight)
     else:
-        throughput_w = 0.8 if args.train_all_tls else 0.5
+        throughput_w = 0.4 if args.train_all_tls else 0.5
 
     if args.reward_waiting_weight is not None:
         waiting_w = float(args.reward_waiting_weight)
     else:
-        waiting_w = 0.1 if args.train_all_tls else 0.0
+        waiting_w = 0.2 if args.train_all_tls else 0.0
 
     return float(halting_w), float(throughput_w), float(waiting_w)
+
+
+def _resolve_train_updates_per_step(args: argparse.Namespace, training_mode: str) -> int:
+    updates = max(1, int(args.train_updates_per_step))
+    if training_mode != "all_tls_shared":
+        return updates
+
+    # Keep smoke fast, but increase optimizer pressure for medium/full all-TLS runs.
+    if args.profile in {"medium", "full"} and updates == 1:
+        return 2
+    return updates
+
+
+def _resolve_finetune_episodes(args: argparse.Namespace, training_mode: str) -> int:
+    if args.single_junction_finetune_episodes is not None:
+        return max(0, int(args.single_junction_finetune_episodes))
+    if training_mode != "all_tls_shared":
+        return 0
+
+    if args.profile == "full":
+        return 8
+    if args.profile == "medium":
+        return 5
+    return 3
 
 
 def main() -> None:
@@ -598,6 +680,8 @@ def main() -> None:
     steps_ep = args.steps_per_episode if args.steps_per_episode is not None else profile["steps_per_episode"]
     training_mode = "all_tls_shared" if args.train_all_tls else "single_tls"
     epsilon_decay = _resolve_epsilon_decay(args, training_mode)
+    train_updates_per_step = _resolve_train_updates_per_step(args, training_mode)
+    finetune_episodes = _resolve_finetune_episodes(args, training_mode)
     reward_halting_w, reward_throughput_w, reward_waiting_w = _resolve_reward_weights(args)
 
     print(
@@ -613,6 +697,10 @@ def main() -> None:
     print(
         f"[P4] Hyperparams: lr={args.lr:g} gamma={args.gamma:g} "
         f"eps=({args.epsilon_start:g}->{args.epsilon_min:g}, decay={epsilon_decay:g})"
+    )
+    print(
+        f"[P4] Optimizer cadence: train_every={args.train_every} "
+        f"updates/step={train_updates_per_step}"
     )
     print(
         f"[P4] Reward weights: halting={reward_halting_w:g} "
@@ -631,8 +719,13 @@ def main() -> None:
         discovered_tls = [tls_id]
 
     train_tls_ids = list(discovered_tls)
-    if args.train_tls_limit is not None and args.train_tls_limit > 0:
-        train_tls_ids = train_tls_ids[:args.train_tls_limit]
+    effective_tls_limit = args.train_tls_limit
+    if args.train_all_tls and effective_tls_limit is None:
+        # A bounded default improves convergence for shared-policy training.
+        effective_tls_limit = 8
+
+    if effective_tls_limit is not None and effective_tls_limit > 0:
+        train_tls_ids = train_tls_ids[:effective_tls_limit]
     if not train_tls_ids:
         train_tls_ids = [tls_id]
 
@@ -641,6 +734,8 @@ def main() -> None:
         preview = ", ".join(train_tls_ids[:6])
         suffix = " ..." if len(train_tls_ids) > 6 else ""
         print(f"[P4] Training junction set ({len(train_tls_ids)}): {preview}{suffix}")
+        if effective_tls_limit is not None:
+            print(f"[P4] Training junction limit: {effective_tls_limit}")
 
     env_cfg = EnvConfig(
         guardrail=GuardrailConfig(min_green_seconds=args.min_green),
@@ -651,10 +746,14 @@ def main() -> None:
     )
 
     # ── Build DQN agent ────────────────────────────────────────────────────
-    if args.use_improved_dqn:
+    # All-junction training uses neighbour-aware observations (OBS_DIM + 1).
+    agent_obs_dim = MultiJunctionEnv.OBS_DIM if args.train_all_tls else OBS_DIM
+    use_improved_dqn = args.use_improved_dqn or (args.train_all_tls and not args.force_basic_dqn)
+
+    if use_improved_dqn:
         print("[P4] Using ImprovedDQNAgent (Double DQN, 3-layer MLP)")
         agent = ImprovedDQNAgent(
-            obs_dim=OBS_DIM,
+            obs_dim=agent_obs_dim,
             n_actions=2,
             hidden_dims=(128, 64),
             lr=args.lr,
@@ -668,8 +767,9 @@ def main() -> None:
             seed=args.seed,
         )
     else:
+        print("[P4] Using baseline DQNAgent")
         agent = DQNAgent(
-            obs_dim=OBS_DIM,
+            obs_dim=agent_obs_dim,
             n_actions=2,
             hidden_dim=args.hidden_dim,
             lr=args.lr,
@@ -697,7 +797,7 @@ def main() -> None:
                 max_steps=steps_ep,
                 seed=ep_seed,
                 train_every=args.train_every,
-                train_updates_per_step=args.train_updates_per_step,
+                train_updates_per_step=train_updates_per_step,
                 env_cfg=env_cfg,
             )
         else:
@@ -728,8 +828,38 @@ def main() -> None:
                 )
 
     train_elapsed = time.time() - t0
+
+    # Short local adaptation for P4.2: tune shared policy on the gate reference junction.
+    finetune_elapsed = 0.0
+    if args.train_all_tls and finetune_episodes > 0:
+        print("\n[P4] ── Single-Junction Fine-Tune ───────────────────────")
+        ft_t0 = time.time()
+        for ft_ep in range(finetune_episodes):
+            ft_seed = args.seed + 4000 + ft_ep
+            ft_result = _run_episode(
+                traci,
+                sumo_binary,
+                sumocfg,
+                tls_id,
+                policy=agent,
+                max_steps=steps_ep,
+                seed=ft_seed,
+                train_agent=agent,
+                train_every=args.train_every,
+                env_cfg=env_cfg,
+            )
+            if ft_ep % max(1, finetune_episodes // 3) == 0 or ft_ep == finetune_episodes - 1:
+                print(
+                    f"  ft_ep={ft_ep:3d}/{finetune_episodes} reward={ft_result['total_reward']:+.2f} "
+                    f"halting={ft_result['mean_halting']:.3f}"
+                )
+        finetune_elapsed = time.time() - ft_t0
+
     training_final_epsilon = round(agent.epsilon, 4)
-    print(f"[P4] Training complete in {train_elapsed:.1f}s")
+    print(
+        f"[P4] Training complete in {train_elapsed:.1f}s"
+        + (f" (+ fine-tune {finetune_elapsed:.1f}s)" if finetune_elapsed > 0 else "")
+    )
 
     # Save weights
     output_dir = _REPO_ROOT / args.output_dir
@@ -747,10 +877,15 @@ def main() -> None:
     }
 
     for name, policy in policies.items():
-        if isinstance(policy, DQNAgent):
+        if _is_rl_agent(policy):
             policy.epsilon = 0.0  # greedy
         for i in range(args.eval_episodes):
             ep_seed = args.seed + 1000 + i
+            if isinstance(policy, (FixedTimePolicy, SimpleActuatedPolicy)):
+                try:
+                    policy.reset(tls_id, 0.0)
+                except Exception:
+                    pass
             r = _run_episode(
                 traci, sumo_binary, sumocfg, tls_id,
                 policy=policy, max_steps=steps_ep, seed=ep_seed,
@@ -790,12 +925,13 @@ def main() -> None:
     marl_agents: dict[str, Any] = {}
     for tid in all_tls_ids:
         try:
-            marl_agent = DQNAgent.load(output_dir, run_id="latest")
+            marl_agent = _load_saved_rl_agent(output_dir, run_id="latest")
             marl_agent.epsilon = 0.0
             marl_agents[tid] = marl_agent
         except Exception:
             # Keep the run alive even if a per-agent load fails.
-            agent.epsilon = 0.0
+            if _is_rl_agent(agent):
+                agent.epsilon = 0.0
             marl_agents[tid] = agent
 
     marl_results: list[dict] = []
@@ -844,9 +980,13 @@ def main() -> None:
             "n_episodes": n_episodes,
             "steps_per_episode": steps_ep,
             "train_every": args.train_every,
-            "train_updates_per_step": args.train_updates_per_step,
+            "train_updates_per_step": train_updates_per_step,
             "n_training_junctions": len(train_tls_ids),
             "training_tls_ids": train_tls_ids,
+            "single_junction_finetune_episodes": finetune_episodes,
+            "single_junction_finetune_elapsed_seconds": round(finetune_elapsed, 1),
+            "agent_class": type(agent).__name__,
+            "agent_obs_dim": int(agent.obs_dim),
             "elapsed_seconds": round(train_elapsed, 1),
             "epsilon_start": args.epsilon_start,
             "epsilon_min": args.epsilon_min,

@@ -74,6 +74,7 @@ def build_sumo_command(
     statistics_output_path: Path | None = None,
     summary_output_path: Path | None = None,
     tripinfo_output_path: Path | None = None,
+    tripinfo_write_unfinished: bool = False,
 ) -> list[str]:
     binary = config.sumo_gui_binary if use_gui else config.sumo_binary
     command = [
@@ -109,6 +110,8 @@ def build_sumo_command(
 
     if tripinfo_output_path is not None:
         command += ["--tripinfo-output", str(tripinfo_output_path)]
+        if tripinfo_write_unfinished:
+            command += ["--tripinfo-output.write-unfinished", "true"]
 
     if use_gui and (config.gui_use_osg_view or force_3d):
         command += ["--osg-view", "true"]

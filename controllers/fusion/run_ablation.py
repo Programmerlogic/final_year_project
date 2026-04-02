@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import numpy as np
 
@@ -42,10 +44,12 @@ from controllers.fusion.fusion_orchestrator import FusionConfig, FusionMode
 # ── Profile presets ───────────────────────────────────────────────────────────
 
 PROFILES = {
-    "smoke": {"max_steps": 500, "seeds": 3},
-    "medium": {"max_steps": 1200, "seeds": 5},
-    "full": {"max_steps": 3600, "seeds": 10},
+    "smoke": {"max_steps": 900, "seeds": 3, "traffic_scale": 1.35},
+    "medium": {"max_steps": 1800, "seeds": 5, "traffic_scale": 1.60},
+    "full": {"max_steps": 3600, "seeds": 10, "traffic_scale": 1.85},
 }
+
+DEFAULT_SERVER_URL = "http://127.0.0.1:5000"
 
 
 @dataclass
@@ -100,12 +104,147 @@ class ExperimentResult:
         }
 
 
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _server_status_url(server_url: str) -> str:
+    return server_url.rstrip("/") + "/status"
+
+
+def _is_server_reachable(server_url: str, *, timeout_seconds: float = 1.0) -> bool:
+    try:
+        with urlrequest.urlopen(_server_status_url(server_url), timeout=timeout_seconds) as resp:
+            return int(getattr(resp, "status", 500)) < 500
+    except (urlerror.URLError, TimeoutError, ValueError):
+        return False
+
+
+def _ensure_server_running(
+    server_url: str,
+    *,
+    verbose: bool = True,
+) -> subprocess.Popen[str] | None:
+    """Ensure the routing server is reachable.
+
+    Returns a managed subprocess if this runner started one, else None.
+    """
+    if _is_server_reachable(server_url):
+        if verbose:
+            print(f"[P5] Reusing active server at {server_url}")
+        return None
+
+    if server_url.rstrip("/") != DEFAULT_SERVER_URL:
+        raise RuntimeError(
+            "Server URL is unreachable and auto-start is only supported for "
+            f"{DEFAULT_SERVER_URL}."
+        )
+
+    server_cmd = [sys.executable, str(_REPO_ROOT / "server.py")]
+    server_env = os.environ.copy()
+    # Stress-tuned but conservative defaults for Phase 5 routing decisions.
+    server_env.setdefault("HYBRID_ENABLE_FORECAST_MODEL", "true")
+    server_env.setdefault("HYBRID_ENABLE_PHASE3_ROUTING", "true")
+    server_env.setdefault("HYBRID_P3_HIGH_RISK_SCORE", "0.82")
+    server_env.setdefault("HYBRID_P3_MEDIUM_RISK_SCORE", "0.45")
+    server_env.setdefault("HYBRID_P3_MAX_REROUTE_FRACTION", "0.18")
+    server_env.setdefault("HYBRID_P3_LOW_CONFIDENCE_THRESHOLD", "0.62")
+    server_env.setdefault("HYBRID_REROUTE_MIN_CONF_FLOOR", "0.65")
+    server_env.setdefault("HYBRID_REROUTE_FRACTION_CAP", "0.12")
+    server_env.setdefault("HYBRID_REROUTE_COOLDOWN_SECONDS", "30.0")
+
+    proc = subprocess.Popen(
+        server_cmd,
+        cwd=str(_REPO_ROOT),
+        env=server_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    deadline = time.perf_counter() + 25.0
+    while time.perf_counter() < deadline:
+        if proc.poll() is not None:
+            break
+        if _is_server_reachable(server_url, timeout_seconds=1.0):
+            if verbose:
+                print(f"[P5] Started managed server at {server_url}")
+            return proc
+        time.sleep(0.4)
+
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    raise RuntimeError(f"Failed to start server at {server_url}")
+
+
+def _stop_managed_server(proc: subprocess.Popen[str] | None, *, verbose: bool = True) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    if verbose:
+        print("[P5] Managed server stopped")
+
+
+def _resolve_signal_policy(
+    rl_model_dir: Path,
+    *,
+    force_rl_model: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether to use RL weights or SimpleActuated fallback.
+
+    In multi-junction ablations, single-TLS artifacts (obs_dim=42) can regress.
+    We use RL weights only when metadata suggests a shared-junction model.
+    """
+    weights_path = rl_model_dir / "latest" / "weights.npz"
+    meta_path = rl_model_dir / "latest" / "meta.json"
+
+    if not weights_path.exists():
+        return False, f"No RL weights found at {weights_path}; using fallback policy"
+
+    if force_rl_model or _is_truthy(os.getenv("HYBRID_P5_FORCE_RL_MODEL")):
+        return True, "RL model forced via CLI/env"
+
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return False, "RL meta unavailable; using fallback policy"
+
+    try:
+        obs_dim = int(meta.get("obs_dim", -1))
+    except Exception:
+        obs_dim = -1
+
+    if obs_dim >= 43:
+        return True, f"RL model accepted (obs_dim={obs_dim})"
+
+    return (
+        False,
+        (
+            f"RL model skipped (obs_dim={obs_dim}) for multi-junction Phase 5; "
+            "using SimpleActuated fallback"
+        ),
+    )
+
+
 def _run_sumo_with_config(
     scenario: str,
     seed: int,
     max_steps: int,
     ablation_config: AblationConfig,
     *,
+    traffic_scale: float,
+    server_url: str,
+    rl_model_dir: Path,
+    use_signal_rl_weights: bool,
     verbose: bool = False,
 ) -> ExperimentResult:
     """Run SUMO pipeline with specific ablation configuration.
@@ -124,19 +263,27 @@ def _run_sumo_with_config(
         "--scenario", scenario,
         "--seed", str(seed),
         "--max-steps", str(max_steps),
+        "--traffic-scale", f"{traffic_scale:.3f}",
         "--tripinfo-output", "/tmp/tripinfo.xml",  # Capture trip data
+        "--tripinfo-write-unfinished",
         "--summary-output", "/tmp/summary.xml",    # Capture summary
     ]
     
     # Add flags based on fusion config
     if fusion_cfg.routing_enabled:
-        cmd.append("--enable-hybrid-uplink-stub")
+        cmd.extend([
+            "--enable-hybrid-uplink-stub",
+            "--server-url", server_url,
+            # Faster coordination loop when fusion coordination is enabled.
+            "--hybrid-batch-seconds", "6.0" if fusion_cfg.coordination_enabled else "7.5",
+            "--route-timeout-seconds", "2.0",
+            "--reroute-highlight-seconds", "0.0",
+        ])
     
     if fusion_cfg.signal_enabled:
-        cmd.extend([
-            "--enable-rl-signal-control",
-            "--rl-model-dir", str(_REPO_ROOT / "models" / "rl" / "artifacts"),
-        ])
+        cmd.extend(["--enable-rl-signal-control", "--rl-min-green-seconds", "10.0"])
+        if use_signal_rl_weights:
+            cmd.extend(["--rl-model-dir", str(rl_model_dir)])
     
     # Set environment variables for fusion mode
     env = os.environ.copy()
@@ -151,9 +298,18 @@ def _run_sumo_with_config(
         env["HYBRID_ENABLE_FORECAST_MODEL"] = "true"
     if fusion_cfg.routing_enabled:
         env["HYBRID_ENABLE_PHASE3_ROUTING"] = "true"
+        env.setdefault("HYBRID_P3_HIGH_RISK_SCORE", "0.82")
+        env.setdefault("HYBRID_P3_MEDIUM_RISK_SCORE", "0.45")
+        env.setdefault("HYBRID_P3_MAX_REROUTE_FRACTION", "0.18")
+        env.setdefault("HYBRID_P3_LOW_CONFIDENCE_THRESHOLD", "0.62")
+        env.setdefault("HYBRID_REROUTE_MIN_CONF_FLOOR", "0.65")
+        env.setdefault("HYBRID_REROUTE_FRACTION_CAP", "0.12")
+        env.setdefault("HYBRID_REROUTE_COOLDOWN_SECONDS", "30.0")
+
+    timeout_seconds = max(600, int(max_steps * 2.5))
     
     if verbose:
-        print(f"  Running: {' '.join(cmd[:6])}...")
+        print(f"  Running: {' '.join(cmd[:8])} ...")
     
     # Run subprocess and capture output
     try:
@@ -162,7 +318,7 @@ def _run_sumo_with_config(
             env=env,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minute timeout
+            timeout=timeout_seconds,
         )
         
         wall_time = time.perf_counter() - t0
@@ -202,7 +358,7 @@ def _run_sumo_with_config(
             vehicles_total=0,
             throughput=0.0,
             mean_halting=1.0,
-            wall_time_s=600.0,
+            wall_time_s=float(timeout_seconds),
         )
     except Exception as e:
         print(f"  Error: {e}")
@@ -236,23 +392,31 @@ def _parse_tripinfo_xml(path: str) -> dict[str, Any]:
         tree = ET.parse(path)
         root = tree.getroot()
         
+        total_entries = 0
+        completed_entries = 0
         durations = []
         waiting_times = []
         
         for trip in root.findall(".//tripinfo"):
+            total_entries += 1
             try:
+                arrival = float(trip.get("arrival", -1))
                 duration = float(trip.get("duration", 0))
                 waiting = float(trip.get("waitingTime", 0))
+                vaporized = str(trip.get("vaporized", "false")).strip().lower() == "true"
                 
-                if duration > 0:
+                if arrival >= 0 and not vaporized and duration > 0:
+                    completed_entries += 1
                     durations.append(duration)
                     waiting_times.append(waiting)
             except (ValueError, TypeError):
                 continue
+
+        kpis["vehicles_total"] = int(total_entries)
+        kpis["vehicles_completed"] = int(completed_entries)
         
         if durations:
             kpis["mean_travel_time_s"] = float(np.mean(durations))
-            kpis["vehicles_completed"] = len(durations)
         
         if waiting_times:
             kpis["mean_waiting_time_s"] = float(np.mean(waiting_times))
@@ -284,6 +448,9 @@ def _parse_tripinfo_xml(path: str) -> dict[str, Any]:
 def _parse_sumo_output(output: str) -> dict[str, Any]:
     """Parse SUMO pipeline output for KPIs."""
     kpis: dict[str, Any] = {}
+    reroutes_total = 0
+    signal_switch_total = 0
+    preemptive_total = 0
     
     for line in output.split("\n"):
         # Parse summary lines
@@ -320,7 +487,25 @@ def _parse_sumo_output(output: str) -> dict[str, Any]:
                 import re
                 match = re.search(r"reroutes?[=:]\s*(\d+)", line, re.IGNORECASE)
                 if match:
-                    kpis["reroutes_applied"] = int(match.group(1))
+                    reroutes_total += int(match.group(1))
+            except (ValueError, AttributeError):
+                pass
+
+        if "signal_switches" in line.lower() or "switches=" in line.lower():
+            try:
+                import re
+                match = re.search(r"signal_switches[=:]\s*(\d+)", line, re.IGNORECASE)
+                if match:
+                    signal_switch_total = max(signal_switch_total, int(match.group(1)))
+            except (ValueError, AttributeError):
+                pass
+
+        if "preempted=" in line.lower() or "pre_emptive" in line.lower():
+            try:
+                import re
+                match = re.search(r"preempted[=:]\s*(\d+)", line, re.IGNORECASE)
+                if match:
+                    preemptive_total += int(match.group(1))
             except (ValueError, AttributeError):
                 pass
         
@@ -344,6 +529,13 @@ def _parse_sumo_output(output: str) -> dict[str, Any]:
     # Compute throughput if we have sim time
     if kpis.get("sim_time_s", 0) > 0 and kpis.get("vehicles_completed", 0) > 0:
         kpis["throughput"] = kpis["vehicles_completed"] / kpis["sim_time_s"] * 3600
+
+    if reroutes_total > 0:
+        kpis["reroutes_applied"] = reroutes_total
+    if signal_switch_total > 0:
+        kpis["signal_switches"] = signal_switch_total
+    if preemptive_total > 0:
+        kpis["pre_emptive_triggers"] = preemptive_total
     
     return kpis
 
@@ -355,7 +547,7 @@ def _compute_statistics(results: list[ExperimentResult]) -> dict[str, Any]:
     
     travel_times = [r.mean_travel_time_s for r in results if r.mean_travel_time_s < float("inf")]
     waiting_times = [r.mean_waiting_time_s for r in results if r.mean_waiting_time_s < float("inf")]
-    throughputs = [r.vehicles_completed for r in results]
+    throughputs = [r.throughput for r in results if r.throughput > 0]
     
     def mean_ci(values: list[float]) -> dict[str, float]:
         if not values:
@@ -386,6 +578,10 @@ def run_ablation_suite(
     ablations: list[str] | None = None,
     n_seeds: int = 5,
     max_steps: int = 1200,
+    traffic_scale: float = 1.0,
+    server_url: str = DEFAULT_SERVER_URL,
+    rl_model_dir: str | Path | None = None,
+    force_rl_model: bool = False,
     output_dir: str | Path = "evaluation",
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -422,37 +618,74 @@ def run_ablation_suite(
     
     if verbose:
         print(f"[P5] Phase 5 Ablation Study — {len(ablation_configs)} configs × {n_seeds} seeds")
-        print(f"[P5] Scenario: {scenario}, Max steps: {max_steps}")
+        print(
+            f"[P5] Scenario: {scenario}, Max steps: {max_steps}, "
+            f"traffic_scale: {traffic_scale:.2f}"
+        )
     
     all_results: dict[str, list[ExperimentResult]] = {}
-    
-    for config in ablation_configs:
-        if verbose:
-            print(f"\n[P5] Running: {config.name}")
-        
-        config_results: list[ExperimentResult] = []
-        
-        for seed in range(n_seeds):
-            actual_seed = 42 + seed
+
+    resolved_server_url = server_url.rstrip("/")
+    resolved_model_dir = (
+        Path(rl_model_dir)
+        if rl_model_dir is not None
+        else (_REPO_ROOT / "models" / "rl" / "artifacts")
+    )
+
+    use_signal_rl_weights, signal_policy_reason = _resolve_signal_policy(
+        resolved_model_dir,
+        force_rl_model=force_rl_model,
+    )
+    if verbose and any(cfg.fusion_config.signal_enabled for cfg in ablation_configs):
+        policy_label = "RL weights" if use_signal_rl_weights else "SimpleActuated fallback"
+        print(f"[P5] Signal policy: {policy_label} ({signal_policy_reason})")
+
+    needs_server = any(cfg.fusion_config.routing_enabled for cfg in ablation_configs)
+    managed_server: subprocess.Popen[str] | None = None
+    if needs_server:
+        managed_server = _ensure_server_running(resolved_server_url, verbose=verbose)
+
+    try:
+        for config in ablation_configs:
             if verbose:
-                print(f"  Seed {actual_seed}...", end=" ", flush=True)
-            
-            result = _run_sumo_with_config(
-                scenario=scenario,
-                seed=actual_seed,
-                max_steps=max_steps,
-                ablation_config=config,
-                verbose=verbose,
-            )
-            config_results.append(result)
-            
-            if verbose:
-                if result.mean_travel_time_s < float("inf"):
-                    print(f"✓ travel={result.mean_travel_time_s:.1f}s vehicles={result.vehicles_completed}")
-                else:
-                    print("✗ failed")
-        
-        all_results[config.name] = config_results
+                print(f"\n[P5] Running: {config.name}")
+
+            config_results: list[ExperimentResult] = []
+
+            for seed in range(n_seeds):
+                actual_seed = 42 + seed
+                if verbose:
+                    print(f"  Seed {actual_seed}...", end=" ", flush=True)
+
+                result = _run_sumo_with_config(
+                    scenario=scenario,
+                    seed=actual_seed,
+                    max_steps=max_steps,
+                    ablation_config=config,
+                    traffic_scale=traffic_scale,
+                    server_url=resolved_server_url,
+                    rl_model_dir=resolved_model_dir,
+                    use_signal_rl_weights=use_signal_rl_weights,
+                    verbose=verbose,
+                )
+                config_results.append(result)
+
+                if verbose:
+                    if result.mean_travel_time_s < float("inf"):
+                        print(
+                            "✓ travel={t:.1f}s vehicles={v} reroutes={r} switches={sw}".format(
+                                t=result.mean_travel_time_s,
+                                v=result.vehicles_completed,
+                                r=result.reroutes_applied,
+                                sw=result.signal_switches,
+                            )
+                        )
+                    else:
+                        print("✗ failed")
+
+            all_results[config.name] = config_results
+    finally:
+        _stop_managed_server(managed_server, verbose=verbose)
     
     # Compute statistics
     stats: dict[str, dict[str, Any]] = {}
@@ -467,6 +700,13 @@ def run_ablation_suite(
         "scenario": scenario,
         "n_seeds": n_seeds,
         "max_steps": max_steps,
+        "traffic_scale": traffic_scale,
+        "server_url": resolved_server_url,
+        "signal_policy": {
+            "use_rl_weights": use_signal_rl_weights,
+            "reason": signal_policy_reason,
+            "model_dir": str(resolved_model_dir),
+        },
         "ablations": {name: cfg.to_dict() for name, cfg in 
                       [(c.name, c) for c in ablation_configs]},
         "statistics": stats,
@@ -578,6 +818,14 @@ def parse_args() -> argparse.Namespace:
                    help="Number of seeds (overrides profile)")
     p.add_argument("--max-steps", type=int, default=None,
                    help="Max simulation steps (overrides profile)")
+    p.add_argument("--traffic-scale", type=float, default=None,
+                   help="Traffic demand multiplier (overrides profile)")
+    p.add_argument("--server-url", default=DEFAULT_SERVER_URL,
+                   help=f"Routing server URL (default: {DEFAULT_SERVER_URL})")
+    p.add_argument("--rl-model-dir", default=str(_REPO_ROOT / "models" / "rl" / "artifacts"),
+                   help="RL model artifact directory for signal control")
+    p.add_argument("--force-rl-model", action="store_true",
+                   help="Force RL weights even when metadata suggests fallback")
     p.add_argument("--ablations", type=str, default=None,
                    help="Comma-separated list of ablation names to run")
     p.add_argument("--output-dir", default="evaluation",
@@ -593,6 +841,11 @@ def main() -> None:
     profile = PROFILES.get(args.profile, PROFILES["smoke"])
     n_seeds = args.seeds if args.seeds is not None else profile["seeds"]
     max_steps = args.max_steps if args.max_steps is not None else profile["max_steps"]
+    traffic_scale = (
+        args.traffic_scale
+        if args.traffic_scale is not None
+        else float(profile.get("traffic_scale", 1.0))
+    )
     
     ablations = None
     if args.ablations:
@@ -603,6 +856,10 @@ def main() -> None:
         ablations=ablations,
         n_seeds=n_seeds,
         max_steps=max_steps,
+        traffic_scale=traffic_scale,
+        server_url=args.server_url,
+        rl_model_dir=args.rl_model_dir,
+        force_rl_model=args.force_rl_model,
         output_dir=args.output_dir,
         verbose=not args.quiet,
     )
