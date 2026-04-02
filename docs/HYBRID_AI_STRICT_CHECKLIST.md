@@ -4,7 +4,7 @@ This plan is the authoritative implementation sequence for the SUMO + FL + RL hy
 
 ## 1) Current Progress Snapshot
 
-Estimated overall completion: **90-95%**
+Estimated overall completion: **95%**
 
 Implemented and passing all gates:
 - SUMO runner + scenario contract + adapter pipeline are operational.
@@ -16,9 +16,11 @@ Implemented and passing all gates:
 - Server integration: forecast artifact + Phase 3 router wired behind feature flags.
 - GNN routing: RSU graph registration via HTTP, per-RSU vehicle segmentation, message-passing confidence.
 - **Phase 4 adaptive signal control**: ALL GATES PASS - DQN outperforms FixedTime baseline (+10.7%), MARL stable on 18 junctions.
+- **Phase 5 hybrid fusion**: FRAMEWORK COMPLETE - FusionOrchestrator, 9 ablation configs, experiment runner with CI computation.
 
-Not implemented yet:
-- Hybrid fusion controller (Phase 5) - combines routing + signal control.
+Remaining work:
+- Phase 5 full evaluation: Run ablation suite on city scenario with 10+ seeds.
+- Phase 5 documentation: Publication-ready report with KPI tables.
 
 ## 2) Strict Working Rules
 
@@ -209,26 +211,33 @@ Execution checklist:
 Goal:
 - Combine forecasting + risk-aware routing + adaptive signal control.
 
-Already done:
-- No fusion orchestration implemented.
+Implemented:
+- `FusionOrchestrator` class: Event-triggered coordination with pre-emptive action.
+- `FusionConfig` with 6 fusion modes (full_hybrid, forecast_only, routing_only, signal_only, reactive_baseline, no_ai).
+- Signal priority hints: Routing provides soft coordination hints to signal control.
+- Graceful degradation: Each subsystem operates independently if others fail.
+- 9 ablation presets for systematic evaluation.
+- `run_ablation.py`: Experiment runner with tripinfo.xml parsing and CI computation.
 
-Left to implement:
-- Event-triggered fusion logic for pre-emptive coordination.
-- Ablation suite (reactive-only, forecast-only, RL-only, full hybrid).
-- Statistical reporting and failure-case analysis.
+Left to complete:
+- Run full ablation suite on city scenario with 10+ seeds.
+- Generate publication-ready KPI tables and visualizations.
+- Document failure cases and mitigations.
 
 Strict completion gates:
-- Gate P5.1: full hybrid outperforms baselines with confidence intervals.
-- Gate P5.2: ablations isolate contribution of each subsystem.
-- Gate P5.3: failure cases documented with root-cause and mitigation.
+- Gate P5.1: full hybrid outperforms baselines with confidence intervals — **PENDING** (framework ready, full run needed).
+- Gate P5.2: ablations isolate contribution of each subsystem — **PENDING** (configs defined, data collection needed).
+- Gate P5.3: failure cases documented with root-cause and mitigation — **PARTIAL** (logging in place).
 
 Execution checklist:
-- [ ] Implement fusion orchestration policy.
-- [ ] Implement ablation experiment configs.
+- [x] Implement fusion orchestration policy.
+- [x] Implement ablation experiment configs.
 - [ ] Run seed sweeps in local runtime.
 - [ ] Generate KPI tables + confidence intervals.
 - [ ] Write publication-ready summary and threats-to-validity.
 - [ ] Save report in docs/reports/phase5_fusion_report.md.
+
+**Phase 5 status: FRAMEWORK COMPLETE, EVALUATION PENDING.**
 
 ## 5) Folder Structure (Current)
 
@@ -246,8 +255,8 @@ Implemented:
 Implemented in Phase 4:
 - `controllers/rl/` — RL environment, DQN agent, baselines, safety guardrails, inference hook, training driver
 
-Still needed for Phase 5:
-- `controllers/fusion/` — hybrid fusion orchestration policy
+Implemented in Phase 5:
+- `controllers/fusion/` — hybrid fusion orchestration policy, ablation configs, experiment runner
 
 ## 6) Weekly Strict Milestone Plan
 
