@@ -87,6 +87,40 @@ Road Side Units (RSUs) are placed at strategic junctions for V2X communication.
 - **Description**: Minimum center-to-center spacing between RSUs
 - **Example**: `--rsu-min-spacing-m 400`
 
+### `--rsu-whitelist RSU_WHITELIST`
+- **Default**: None (all RSUs active)
+- **Description**: Comma-separated list of RSU aliases to keep active. Only these RSUs will be displayed and used for V2X communication. Useful for focusing on specific intersections.
+- **Format**: Accepts `A`, `RSU_A`, or `RSU-A` format
+- **Example**: `--rsu-whitelist "A,K,M,R,P,T,V,Y"` (keep only 8 specific RSUs)
+- **Example**: `--rsu-whitelist "RSU_A,RSU_K,RSU_M"` (same with prefix)
+
+### `--rsu-config RSU_CONFIG`
+- **Default**: None (auto-detect RSUs)
+- **Description**: Path to a JSON configuration file with custom RSU placements and real place names. When specified, this overrides auto-detection.
+- **Example**: `--rsu-config data/rsu_config_kolkata.json`
+- **JSON Format**:
+```json
+{
+    "rsus": [
+        {
+            "id": "ESPLANADE",
+            "display_name": "Esplanade",
+            "junction_id": "663940665",
+            "x": 2413.83,
+            "y": 9027.56,
+            "lat": 22.577782,
+            "lon": 88.369245,
+            "description": "Central bus terminus, Metro hub"
+        }
+    ]
+}
+```
+- **Features**:
+  - Custom RSU IDs and display names (shown in GUI)
+  - Junction IDs validated against network
+  - Coordinates used to find nearest junction if junction_id not exact match
+  - Lat/lon stored for documentation purposes
+
 ---
 
 ## Traffic Control
